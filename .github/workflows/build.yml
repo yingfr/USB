@@ -1,0 +1,76 @@
+name: Build and Run USB RW Program
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+
+jobs:
+  build-msvc:
+    name: Build with MSVC (cl)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Compile with cl.exe
+        run: cl usb_rw_windows.c /Fe:usb_rw_windows.exe
+
+      - name: Run program (expects no USB drive in CI)
+        run: |
+          .\usb_rw_windows.exe
+          $code = $LASTEXITCODE
+          if ($code -eq 0) {
+            Write-Host "Program completed successfully."
+          } elseif ($code -eq 1) {
+            Write-Host "Program exited with code 1: No removable drive found (expected in CI)."
+          } else {
+            Write-Error "Program failed with unexpected exit code: $code"
+            exit $code
+          }
+        shell: pwsh
+
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: usb_rw_windows-msvc
+          path: usb_rw_windows.exe
+
+  build-mingw:
+    name: Build with MinGW (gcc)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Compile with gcc (MinGW)
+        run: gcc usb_rw_windows.c -o usb_rw_windows.exe
+        shell: cmd
+
+      - name: Run program (expects no USB drive in CI)
+        run: |
+          .\usb_rw_windows.exe
+          $code = $LASTEXITCODE
+          if ($code -eq 0) {
+            Write-Host "Program completed successfully."
+          } elseif ($code -eq 1) {
+            Write-Host "Program exited with code 1: No removable drive found (expected in CI)."
+          } else {
+            Write-Error "Program failed with unexpected exit code: $code"
+            exit $code
+          }
+        shell: pwsh
+
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: usb_rw_windows-mingw
+          path: usb_rw_windows.exe
