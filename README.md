@@ -16,10 +16,26 @@ Windows 平台 U 盘读写示例程序，使用 Win32 API（`CreateFile` / `Read
 cl usb_rw_windows.c /Fe:usb_rw_windows.exe
 ```
 
-### MinGW (gcc)
+### MinGW (gcc, Windows)
 
 ```bat
 gcc usb_rw_windows.c -o usb_rw_windows.exe
+```
+
+### MinGW-w64 交叉编译（Linux → Windows）
+
+先安装工具链（Ubuntu/Debian）：
+
+```bash
+sudo apt-get install gcc-mingw-w64-x86-64
+```
+
+然后编译：
+
+```bash
+make
+# 或直接运行：
+x86_64-w64-mingw32-gcc usb_rw_windows.c -o usb_rw_windows.exe
 ```
 
 ## 运行注意事项
