@@ -1,0 +1,42 @@
+name: Build USB Tool
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore USBTool.csproj
+
+      - name: Build
+        run: dotnet build USBTool.csproj --configuration Release --no-restore
+
+      - name: Publish single-file exe
+        run: >
+          dotnet publish USBTool.csproj
+          --configuration Release
+          --runtime win-x64
+          --self-contained true
+          --output publish
+          /p:PublishSingleFile=true
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: USBTool-win-x64
+          path: publish/USBTool.exe
