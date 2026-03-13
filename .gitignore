@@ -1,0 +1,7 @@
+# Build artifacts
+usb_scsi_detect
+
+# Windows build artefacts
+*.exe
+*.obj
+*.o
