@@ -1,30 +1,94 @@
 # USB
 
-Windows 平台 U 盘读写示例程序，使用 Win32 API（`CreateFile` / `ReadFile` / `WriteFile`）对可移动存储设备进行文件读写。
+Windows 平台下的 U 盘 SCSI pass-through 轮询程序。
+
+程序会自动找到第一个可移动驱动器，尝试打开卷设备或物理设备，然后执行：
+
+- `SCSI INQUIRY (0x12)`：读取厂商和产品信息
+- `READ CAPACITY(10) (0x25)`：读取块大小与最后 LBA
+- `VENDOR RECEIVE (0x98)`：按周期拉取数据并打印 HEX/ASCII
+
+按 `Ctrl+C` 可优雅退出。
 
 ## 文件说明
 
 | 文件 | 说明 |
 |------|------|
-| `usb_rw_windows.c` | 主程序：自动找到第一个可移动驱动器，写入测试文件并回读验证 |
+| `usb_rw_windows.c` | 主程序（设备发现、SCSI 命令发送、轮询打印） |
+| `Makefile` | 使用 MinGW gcc 构建可执行文件 |
 
-## 编译方式
+## 构建
 
-### MSVC (cl)
-
-```bat
-cl usb_rw_windows.c /Fe:usb_rw_windows.exe
-```
-
-### MinGW (gcc)
+### 使用 Makefile（推荐）
 
 ```bat
-gcc usb_rw_windows.c -o usb_rw_windows.exe
+make
 ```
 
-## 运行注意事项
+Windows 下默认使用 `gcc`，Linux 下默认使用 `x86_64-w64-mingw32-gcc` 交叉编译。
 
-1. **需要插入 U 盘**：程序会自动扫描驱动器列表，找到第一个类型为 `DRIVE_REMOVABLE` 的驱动器。
-2. **写入文件**：程序会在 U 盘根目录写入 `usb_test.txt` 并回读验证内容。
-3. **管理员权限**：通常不需要，但如果 U 盘有写保护或访问受限，请以管理员身份运行。
-4. **仅支持 Windows**：代码依赖 Win32 API，不支持 Linux/macOS。
+### 手动编译（MinGW）
+
+```bat
+gcc -Wall -Wextra -O2 usb_rw_windows.c -o usb_rw_windows.exe
+```
+
+### 手动编译（MSVC）
+
+```bat
+cl /W4 /O2 usb_rw_windows.c /Fe:usb_rw_windows.exe
+```
+
+## 运行
+
+```bat
+usb_rw_windows.exe [poll_ms] [packet_blocks]
+```
+
+参数说明：
+
+- `poll_ms`：轮询间隔（毫秒），默认 `200`
+- `packet_blocks`：每次请求的块数，默认 `8`，范围 `[1, 65535]`
+
+程序会根据 `READ CAPACITY(10)` 返回的块大小计算：
+
+- `packet_bytes = packet_blocks * block_size`
+- 最大不超过 `4 MiB`
+- 若 `READ CAPACITY(10)` 失败，块大小回退到 `512`
+
+## 运行流程
+
+1. 扫描逻辑盘符并选取第一个 `DRIVE_REMOVABLE`
+2. 通过 `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` 尝试映射 `PhysicalDrive`
+3. 优先打开 `\\.\X:`，失败再尝试 `\\.\PhysicalDriveN`
+4. 发送 `INQUIRY` 与 `READ CAPACITY(10)`
+5. 进入循环，使用 `0x98` 接收数据并打印
+
+## 输出示例
+
+程序会输出类似日志：
+
+- `SCSI INQUIRY: vendor='...' product='...'`
+- `READ CAPACITY(10): last_lba=... block_size=... bytes`
+- `[poll N] stream bytes=...`
+- 随后打印 HEX 和 ASCII 视图（最多展示前 256 字节）
+
+## 常见问题
+
+1. 找不到 U 盘
+
+- 确认 U 盘已挂载并显示为可移动设备。
+
+2. 打开设备失败或 SCSI 命令失败
+
+- 尝试以管理员权限运行。
+- 某些设备/驱动不支持 `0x98`，会出现设备错误或空返回。
+
+3. 热插拔后中断
+
+- 当前默认关闭自动重连（`ENABLE_SCSI_RECONNECT = 0`）。
+- 如需实验重连，可在源码中开启该宏后重新编译。
+
+## 说明
+
+这是一个面向调试和验证的低层示例，不是通用 U 盘文件系统读写工具。
