@@ -8,6 +8,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <stddef.h>
+#include <stdarg.h>
 
 #define SENSE_BUF_LEN 32
 #define INVALID_DISK_NUMBER 0xFFFFFFFFu
@@ -34,6 +35,76 @@ static DWORD g_last_scsi_winerr = 0;
 static UCHAR g_last_scsi_status = 0;
 static UCHAR g_last_scsi_sense[SENSE_BUF_LEN];
 static int g_reconnect_mask_notice_printed = 0;
+static FILE* g_log_file = NULL;
+
+static int open_log_file(const char* path) {
+    if (g_log_file) {
+        return 1;
+    }
+
+    g_log_file = fopen(path, "a");
+    return (g_log_file != NULL);
+}
+
+static void close_log_file(void) {
+    if (g_log_file) {
+        fclose(g_log_file);
+        g_log_file = NULL;
+    }
+}
+
+static int log_vfprintf(FILE* stream, const char* format, va_list args) {
+    int result;
+    va_list fileArgs;
+
+    va_copy(fileArgs, args);
+    result = vfprintf(stream, format, args);
+    fflush(stream);
+
+    if (g_log_file) {
+        vfprintf(g_log_file, format, fileArgs);
+        fflush(g_log_file);
+    }
+
+    va_end(fileArgs);
+    return result;
+}
+
+static int log_printf(const char* format, ...) {
+    int result;
+    va_list args;
+
+    va_start(args, format);
+    result = log_vfprintf(stdout, format, args);
+    va_end(args);
+    return result;
+}
+
+static int log_fprintf(FILE* stream, const char* format, ...) {
+    int result;
+    va_list args;
+
+    va_start(args, format);
+    result = log_vfprintf(stream, format, args);
+    va_end(args);
+    return result;
+}
+
+static int log_putchar(int ch) {
+    int result = fputc(ch, stdout);
+    fflush(stdout);
+
+    if (g_log_file) {
+        fputc(ch, g_log_file);
+        fflush(g_log_file);
+    }
+
+    return result;
+}
+
+#define printf(...) log_printf(__VA_ARGS__)
+#define fprintf(stream, ...) log_fprintf((stream), __VA_ARGS__)
+#define putchar(ch) log_putchar((ch))
 
 static BOOL WINAPI console_ctrl_handler(DWORD ctrlType) {
     switch (ctrlType) {
@@ -375,6 +446,100 @@ static uint32_t be32_to_u32(const uint8_t* p) {
            ((uint32_t)p[3]);
 }
 
+static uint16_t be16_to_u16(const uint8_t* p) {
+    return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+}
+
+static uint16_t xor_checksum_u16(const uint8_t* pData, DWORD length) {
+    uint16_t checksum = 0;
+
+    if (!pData || length == 0) {
+        return 0;
+    }
+
+    for (DWORD i = 0; i < length; ++i) {
+        checksum = (uint16_t)(checksum ^ pData[i]);
+    }
+
+    return checksum;
+}
+
+static void print_cccs_ascii_if_valid(const uint8_t* buf, DWORD size) {
+    const DWORD ccnpHeaderLen = 12;
+    const DWORD cccsFixedDataLen = 4 + 2 + 12;
+    const DWORD cccsMinLen = 1 + 2 + 2 + 2 + cccsFixedDataLen + 2 + 1;
+    const uint8_t* payload;
+    DWORD payloadLen;
+    uint16_t len2;
+    DWORD frameLen;
+    uint16_t recvChecksum;
+    uint16_t calcChecksum;
+    uint32_t seq;
+    const uint8_t* ts;
+    const uint8_t* content;
+    DWORD contentLen;
+    char tsAscii[13];
+    char* contentAscii;
+
+    if (!buf || size < (ccnpHeaderLen + cccsMinLen)) {
+        return;
+    }
+
+    if (buf[0] != 0x5B) {
+        return;
+    }
+
+    payload = buf + ccnpHeaderLen;
+    payloadLen = size - ccnpHeaderLen;
+
+    if (payload[0] != 0x13) {
+        return;
+    }
+
+    len2 = be16_to_u16(&payload[5]);
+    if (len2 < cccsFixedDataLen) {
+        return;
+    }
+
+    frameLen = 1 + 2 + 2 + 2 + (DWORD)len2 + 2 + 1;
+    if (payloadLen < frameLen) {
+        return;
+    }
+
+    recvChecksum = be16_to_u16(&payload[7 + (DWORD)len2]);
+    calcChecksum = xor_checksum_u16(&payload[1], 6 + (DWORD)len2);
+    if (recvChecksum != calcChecksum) {
+        return;
+    }
+
+    seq = be32_to_u32(&payload[7]);
+    ts = &payload[13];
+    content = &payload[13 + 12];
+    contentLen = (DWORD)len2 - cccsFixedDataLen;
+
+    for (DWORD i = 0; i < 12; ++i) {
+        tsAscii[i] = isprint(ts[i]) ? (char)ts[i] : '.';
+    }
+    tsAscii[12] = '\0';
+
+    contentAscii = (char*)malloc((size_t)contentLen + 1u);
+    if (!contentAscii) {
+        return;
+    }
+
+    for (DWORD i = 0; i < contentLen; ++i) {
+        contentAscii[i] = isprint(content[i]) ? (char)content[i] : '.';
+    }
+    contentAscii[contentLen] = '\0';
+
+    printf("CCCS checksum OK: seq=%lu timestamp=%s content=%s\n",
+           (unsigned long)seq,
+           tsAscii,
+           contentAscii);
+
+    free(contentAscii);
+}
+
 static int scsi_read_capacity10(HANDLE hDisk, uint32_t* outLastLba, uint32_t* outBlockSize) {
     uint8_t cdb[10] = {0};
     uint8_t* data = (uint8_t*)alloc_io_buffer(8);
@@ -507,15 +672,16 @@ static int monitor_scsi_stream_output(
         ++pollCount;
 
         if (!scsi_receive_vendor98(*inoutDisk, buf, packetBytes, &nBytesRead)) {
-            print_last_scsi_error("receive(0x98)");
+            //print_last_scsi_error("receive(0x98)");
 
             if (ENABLE_SCSI_RECONNECT && is_recoverable_scsi_error()) {
                 if (reconnect_scsi_target(letter, diskNumber, inoutDisk, inoutBlockSize)) {
                     if (!scsi_receive_vendor98(*inoutDisk, buf, packetBytes, &nBytesRead)) {
                         print_last_scsi_error("receive(0x98) retry");
                     } else if (nBytesRead > 0) {
-                        printf("[poll %lu] stream bytes=%lu\n", pollCount, (unsigned long)nBytesRead);
-                        print_hex_ascii(buf, nBytesRead, 256);
+                        //printf("[poll %lu] stream bytes=%lu\n", pollCount, (unsigned long)nBytesRead);
+                        //print_hex_ascii(buf, nBytesRead, 256);
+                        print_cccs_ascii_if_valid(buf, nBytesRead);
                     }
                 }
             } else if (!ENABLE_SCSI_RECONNECT && is_recoverable_scsi_error() && !g_reconnect_mask_notice_printed) {
@@ -528,8 +694,9 @@ static int monitor_scsi_stream_output(
         }
 
         if (nBytesRead > 0) {
-            printf("[poll %lu] stream bytes=%lu\n", pollCount, (unsigned long)nBytesRead);
-            print_hex_ascii(buf, nBytesRead, 256);
+            //printf("[poll %lu] stream bytes=%lu\n", pollCount, (unsigned long)nBytesRead);
+            //print_hex_ascii(buf, nBytesRead, 256);
+            print_cccs_ascii_if_valid(buf, nBytesRead);
         }
 
         Sleep(pollMs);
@@ -540,6 +707,7 @@ static int monitor_scsi_stream_output(
 }
 
 int main(int argc, char** argv) {
+    const char* logPath = "usb_rw_windows_log.txt";
     uint32_t pollMs = DEFAULT_POLL_MS;
     uint32_t packetBlocks = DEFAULT_PACKET_BLOCKS;
     uint32_t blockSize = DEFAULT_BLOCK_SIZE;
@@ -549,25 +717,36 @@ int main(int argc, char** argv) {
     DWORD diskNumber = INVALID_DISK_NUMBER;
     HANDLE hDisk = INVALID_HANDLE_VALUE;
     uint32_t lastLba = 0;
+    int exitCode = 0;
+
+    if (!open_log_file(logPath)) {
+        fprintf(stderr, "Warning: failed to open log file: %s\n", logPath);
+    } else {
+        printf("Logging to %s\n", logPath);
+    }
 
     if (argc > 1 && !parse_u32(argv[1], &pollMs)) {
         fprintf(stderr, "Invalid poll_ms: %s\n", argv[1]);
-        return 1;
+        exitCode = 1;
+        goto cleanup;
     }
     if (argc > 2 && !parse_u32(argv[2], &packetBlocks)) {
         fprintf(stderr, "Invalid packet_blocks: %s\n", argv[2]);
-        return 1;
+        exitCode = 1;
+        goto cleanup;
     }
     if (packetBlocks == 0 || packetBlocks > 65535) {
         fprintf(stderr, "packet_blocks must be in range [1, 65535].\n");
-        return 1;
+        exitCode = 1;
+        goto cleanup;
     }
 
     printf("Usage: %s [poll_ms] [packet_blocks]\n", argv[0]);
 
     if (!find_first_removable_drive(&letter)) {
         fprintf(stderr, "No removable drive found. Please insert a USB drive.\n");
-        return 1;
+        exitCode = 1;
+        goto cleanup;
     }
 
     printf("Using removable drive letter: %c:\\\n", letter);
@@ -580,15 +759,16 @@ int main(int argc, char** argv) {
     hDisk = open_scsi_target(letter, diskNumber);
     if (hDisk == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "Failed to open SCSI target.\n");
-        return 2;
+        exitCode = 2;
+        goto cleanup;
     }
 
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
 
     if (!scsi_inquiry(hDisk)) {
         print_last_scsi_error("SCSI INQUIRY");
-        CloseHandle(hDisk);
-        return 3;
+        exitCode = 3;
+        goto cleanup;
     }
 
     if (!scsi_read_capacity10(hDisk, &lastLba, &blockSize)) {
@@ -605,17 +785,23 @@ int main(int argc, char** argv) {
         fprintf(stderr, "packet_bytes out of range: %llu (max=%u)\n",
                 (unsigned long long)packetBytes64,
                 MAX_PACKET_BYTES);
-        CloseHandle(hDisk);
-        return 4;
+        exitCode = 4;
+        goto cleanup;
     }
     packetBytes = (DWORD)packetBytes64;
 
     if (!monitor_scsi_stream_output(&hDisk, letter, diskNumber, packetBytes, pollMs, &blockSize)) {
-        CloseHandle(hDisk);
-        return 5;
+        exitCode = 5;
+        goto cleanup;
     }
 
-    CloseHandle(hDisk);
     printf("Stopped.\n");
-    return 0;
+
+cleanup:
+    if (hDisk != INVALID_HANDLE_VALUE) {
+        CloseHandle(hDisk);
+        hDisk = INVALID_HANDLE_VALUE;
+    }
+    close_log_file();
+    return exitCode;
 }
